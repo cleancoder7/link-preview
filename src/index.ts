@@ -9,6 +9,16 @@ import { HTMLElement, parse } from "node-html-parser";
 
 export interface Env {}
 
+interface BulkRequestBody {
+  urls: string[];
+}
+
+interface BulkResponse {
+  results: {
+    [url: string]: Metadata;
+  };
+}
+
 function dbg(...message: any[]) {
   console.info("[✌ link-preview] ", ...message);
 }
@@ -23,12 +33,54 @@ export default {
     const origin = request.headers.get("Origin") || "*";
 
     if (request.method === "OPTIONS") {
-      // Handle (accept) preflight requests from web browsers
       return handleOptions(request, origin);
+    } else if (request.method === "POST") {
+      try {
+        const body: BulkRequestBody = await request.json();
+        if (!body.urls || !Array.isArray(body.urls)) {
+          return handleError(400, "Request body must contain 'urls' array", origin);
+        }
+
+        // Limit the number of URLs that can be processed in one request
+        const MAX_URLS = 10;
+        if (body.urls.length > MAX_URLS) {
+          return handleError(400, `Maximum ${MAX_URLS} URLs allowed per request`, origin);
+        }
+
+        // Process all URLs concurrently
+        const results = await Promise.all(
+          body.urls.map(async (url) => {
+            try {
+              const metadata = await extractMetadata(url);
+              return [url, metadata];
+            } catch (e) {
+              return [url, {
+                error: `Failed to process URL: ${e.message}`,
+                status: 422
+              }];
+            }
+          })
+        );
+
+        // Convert results array to object with URLs as keys
+        const response: BulkResponse = {
+          results: Object.fromEntries(results)
+        };
+
+        return new Response(JSON.stringify(response), {
+          headers: withMonthLongCache(
+            withCorsHeaders(origin, {
+              "content-type": "application/json",
+            })
+          ),
+        });
+      } catch (e) {
+        return handleError(400, "Invalid JSON in request body", origin);
+      }
     } else if (request.method === "GET") {
       const query = reqUrl.searchParams.get("q");
       if (query) {
-        // Primary feature: Return website's metadata for preview
+        // Keep existing single URL GET endpoint for backward compatibility
         try {
           const md = await extractMetadata(query);
           if (md.error) {
@@ -48,7 +100,6 @@ export default {
       } else {
         const twitterUserName = reqUrl.searchParams.get("tw-profile-icon");
         if (twitterUserName) {
-          // Hidden feature: Directly return Twitter profile image (and cache)
           return handleGetTwitterProfileImage(twitterUserName, origin);
         } else {
           return handleError(400, "Bad Request", origin);
@@ -59,6 +110,7 @@ export default {
     }
   },
 };
+
 
 // From: https://stackoverflow.com/a/69685872
 function handleOptions(request: Request, origin: string) {
